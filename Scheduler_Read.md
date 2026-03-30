@@ -7,14 +7,15 @@
 ## 目录
 
 - [1. 架构总览](#1-架构总览)
-- [2. 核心组件介绍](#2-核心组件介绍)
-- [3. 集群启动流程](#3-集群启动流程)
-- [4. Job 提交与启动流程](#4-job-提交与启动流程)
-- [5. 资源调度与 Slot 管理](#5-资源调度与-slot-管理)
-- [6. Kubernetes Pod 生命周期管理](#6-kubernetes-pod-生命周期管理)
-- [7. Pod 装饰器模式详解](#7-pod-装饰器模式详解)
-- [8. 容错与恢复机制](#8-容错与恢复机制)
-- [9. 关键源码索引](#9-关键源码索引)
+- [2. Kubernetes 资源类型详解](#2-kubernetes-资源类型详解)
+- [3. 核心组件介绍](#3-核心组件介绍)
+- [4. 集群启动流程](#4-集群启动流程)
+- [5. Job 提交与启动流程](#5-job-提交与启动流程)
+- [6. 资源调度与 Slot 管理](#6-资源调度与-slot-管理)
+- [7. Kubernetes Pod 生命周期管理](#7-kubernetes-pod-生命周期管理)
+- [8. Pod 装饰器模式详解](#8-pod-装饰器模式详解)
+- [9. 容错与恢复机制](#9-容错与恢复机制)
+- [10. 关键源码索引](#10-关键源码索引)
 
 ---
 
@@ -136,9 +137,283 @@ graph LR
 
 ---
 
-## 2. 核心组件介绍
+## 2. Kubernetes 资源类型详解
 
-### 2.1 组件交互关系图
+Flink 在 Kubernetes 上部署时，**不使用** K8s Job、StatefulSet 或 ReplicaSet，而是采用以下资源组合：
+
+### 2.1 资源总览图
+
+```mermaid
+graph TB
+    subgraph "Flink 创建的 K8s 资源"
+        subgraph "JobManager"
+            DEP["Deployment<br/>━━━━━━━━━━━━━━<br/>apiVersion: apps/v1<br/>replicas: 1 (默认)<br/>管理 JM Pod 生命周期"]
+            JM_POD["JM Pod<br/>(由 Deployment 管理)"]
+        end
+
+        subgraph "TaskManagers"
+            TM_POD1["TM Pod 1<br/>━━━━━━━━━━━━━━<br/>裸 Pod<br/>无控制器管理"]
+            TM_POD2["TM Pod 2<br/>裸 Pod"]
+            TM_PODN["TM Pod N<br/>裸 Pod"]
+        end
+
+        subgraph "Services"
+            SVC_INT["Internal Service<br/>━━━━━━━━━━━━━━<br/>Headless ClusterIP<br/>clusterIP: None<br/>端口: RPC + BlobServer"]
+            SVC_EXT["External Service<br/>━━━━━━━━━━━━━━<br/>可配置类型:<br/>ClusterIP / NodePort<br/>/ LoadBalancer<br/>端口: REST API"]
+        end
+
+        subgraph "ConfigMaps"
+            CM_FLINK["Flink ConfigMap<br/>━━━━━━━━━━━━━━<br/>flink-conf.yaml<br/>log4j.properties<br/>logback.xml"]
+            CM_HADOOP["Hadoop ConfigMap<br/>━━━━━━━━━━━━━━<br/>(可选)<br/>core-site.xml<br/>hdfs-site.xml"]
+        end
+    end
+
+    subgraph "用户预创建的 K8s 资源 (Flink 仅引用)"
+        PVC["PersistentVolumeClaim<br/>(可选)"]
+        SECRET["Secret<br/>(可选)"]
+    end
+
+    DEP -->|"管理"| JM_POD
+    JM_POD -.->|"OwnerReference"| TM_POD1
+    JM_POD -.->|"OwnerReference"| TM_POD2
+    JM_POD -.->|"OwnerReference"| TM_PODN
+    SVC_INT -->|"选择"| JM_POD
+    SVC_EXT -->|"选择"| JM_POD
+    CM_FLINK -->|"挂载到"| JM_POD
+    CM_FLINK -->|"挂载到"| TM_POD1
+    CM_HADOOP -.->|"挂载到"| JM_POD
+    PVC -.->|"挂载到"| TM_POD1
+    SECRET -.->|"引用"| JM_POD
+
+    style DEP fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style TM_POD1 fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style TM_POD2 fill:#e8f5e9,stroke:#2e7d32
+    style TM_PODN fill:#e8f5e9,stroke:#2e7d32
+    style SVC_INT fill:#fff3e0,stroke:#e65100
+    style SVC_EXT fill:#fff3e0,stroke:#e65100
+    style CM_FLINK fill:#f3e5f5,stroke:#6a1b9a
+    style CM_HADOOP fill:#f3e5f5,stroke:#6a1b9a
+    style PVC fill:#fafafa,stroke:#9e9e9e,stroke-dasharray: 5 5
+    style SECRET fill:#fafafa,stroke:#9e9e9e,stroke-dasharray: 5 5
+```
+
+### 2.2 资源清单
+
+| K8s 资源类型 | 数量 | Flink 是否创建 | 用途 | 源码位置 |
+|---|---|---|---|---|
+| **Deployment** | 1 | 是 | JobManager | `KubernetesJobManagerFactory.java` |
+| **Pod** (裸 Pod) | N | 是 | TaskManager | `KubernetesTaskManagerFactory.java` |
+| **Service** (Headless ClusterIP) | 1 | 是 | JM 内部 RPC 通信 | `InternalServiceDecorator.java` |
+| **Service** (可配置类型) | 1 | 是 | REST API / Web UI 暴露 | `ExternalServiceDecorator.java` |
+| **ConfigMap** (Flink 配置) | 1 | 是 | flink-conf.yaml 等配置文件 | `FlinkConfMountDecorator.java` |
+| **ConfigMap** (Hadoop 配置) | 0-1 | 是 (可选) | Hadoop 配置文件 | `HadoopConfMountDecorator.java` |
+| **PersistentVolumeClaim** | N | 否 (仅引用) | 持久存储 | `PersistentVolumeClaimMountDecorator.java` |
+| **Secret** | N | 否 (仅引用) | 凭据/密钥 | `EnvSecretsDecorator.java` / `MountSecretsDecorator.java` |
+
+### 2.3 JobManager — Deployment (非 K8s Job)
+
+JobManager 使用 **Kubernetes Deployment** 资源部署，而非 K8s Job 或 StatefulSet。
+
+**源码位置：** `KubernetesJobManagerFactory.java:100-141`
+
+```java
+// 源码摘要
+return new DeploymentBuilder()
+    .withApiVersion(Constants.APPS_API_VERSION)  // "apps/v1"
+    .editOrNewMetadata()
+        .withName(KubernetesUtils.getDeploymentName(clusterId))
+    .editOrNewSpec()
+        .withReplicas(kubernetesJobManagerParameters.getReplicas())  // 默认 1
+        // ... PodTemplate ...
+    .build();
+```
+
+**关键配置：**
+- `replicas` 默认为 **1**，通过 `kubernetes.jobmanager.replicas` 配置（`KubernetesConfigOptions.java:514`）
+- 启用 HA 时可以设置 replicas > 1，实现 JM 的主备
+- Deployment Controller 负责 JM Pod 崩溃时的自动重启
+
+### 2.4 TaskManager — 裸 Pod (非 Deployment)
+
+TaskManager 使用**裸 Pod** 部署，不由任何 K8s 控制器（Deployment / StatefulSet / ReplicaSet）管理。
+
+**源码位置：** `KubernetesTaskManagerFactory.java:49-85`
+
+```java
+// 源码摘要
+final Pod resolvedPod = new PodBuilder(flinkPod.getPodWithoutMainContainer())
+    .editOrNewSpec()
+        .addToContainers(flinkPod.getMainContainer())
+    .endSpec()
+    .build();
+return new KubernetesPod(resolvedPod);
+```
+
+**为什么选择裸 Pod 而非 Deployment？**
+
+```mermaid
+flowchart LR
+    subgraph "Deployment 管理方式"
+        D_CTRL["K8s Deployment<br/>Controller"]
+        D_RS["ReplicaSet"]
+        D_POD["Pod 1..N"]
+        D_CTRL -->|"固定副本数"| D_RS --> D_POD
+    end
+
+    subgraph "Flink 管理方式 (实际采用)"
+        F_RM["Flink<br/>ResourceManager"]
+        F_SM["SlotManager"]
+        F_DRV["K8s RM Driver"]
+        F_POD["裸 Pod 1..N"]
+        F_RM --> F_SM -->|"按需伸缩"| F_DRV -->|"直接创建/删除"| F_POD
+    end
+
+    style D_CTRL fill:#ffebee,stroke:#c62828
+    style F_RM fill:#e8f5e9,stroke:#2e7d32
+```
+
+| 对比维度 | Deployment 方式 | Flink 裸 Pod 方式 |
+|---------|----------------|------------------|
+| 伸缩控制 | K8s 按副本数管理，所有 Pod 同质 | Flink RM 按需创建，每个 Pod 可有不同资源规格 |
+| 生命周期 | K8s Controller 自动重启 | Flink 自行决定是否重建 |
+| 资源配置 | 统一 PodTemplate | 每个 TM Pod 可以有独立的资源配置 |
+| Pod 命名 | 随机后缀 | `{clusterId}-taskmanager-{attemptId}-{podIndex}` |
+| 级联删除 | 通过 ReplicaSet | 通过 OwnerReference 指向 JM Deployment |
+
+**OwnerReference 级联清理：**
+
+`Fabric8FlinkKubeClient` 在创建每个 TM Pod 时，都会设置 `OwnerReference` 指向 JM 的 Deployment。当 JM Deployment 被删除时，K8s 垃圾回收机制会自动清理所有关联的 TM Pod。
+
+### 2.5 Internal Service — Headless ClusterIP
+
+**源码位置：** `InternalServiceDecorator.java:47-69`、`HeadlessClusterIPService.java:43-69`
+
+```java
+// 源码摘要
+.withClusterIP("None")  // Headless
+.withSelector(kubernetesJobManagerParameters.getSelectors())
+.addNewPort()
+    .withName(Constants.JOB_MANAGER_RPC_PORT_NAME)
+    .withPort(kubernetesJobManagerParameters.getRPCPort())
+.addNewPort()
+    .withName(Constants.BLOB_SERVER_PORT_NAME)
+    .withPort(kubernetesJobManagerParameters.getBlobServerPort())
+```
+
+| 属性 | 值 |
+|------|-----|
+| **类型** | ClusterIP (Headless, `clusterIP: "None"`) |
+| **端口** | RPC Port + BlobServer Port |
+| **作用** | TaskManager → JobManager 的内部 RPC 通信和大文件传输 |
+| **DNS** | `{clusterId}-rest.{namespace}.svc` |
+
+### 2.6 External Service — 可配置类型
+
+**源码位置：** `ExternalServiceDecorator.java:43-51`
+
+```java
+// 源码摘要
+.withType(kubernetesJobManagerParameters
+    .getRestServiceExposedType()
+    .serviceType()
+    .getType())
+.addNewPort()
+    .withName(Constants.REST_PORT_NAME)
+    .withPort(kubernetesJobManagerParameters.getRestPort())
+```
+
+通过配置项 `kubernetes.rest-service.exposed.type` 选择暴露方式：
+
+```mermaid
+flowchart TD
+    CFG["配置: kubernetes.rest-service.exposed.type"] --> T{"Service 类型"}
+
+    T -->|"ClusterIP<br/>(默认)"| A["ClusterIP Service<br/>━━━━━━━━━━━━━━<br/>仅集群内访问<br/>适合: 内部使用"]
+    T -->|"NodePort"| B["NodePort Service<br/>━━━━━━━━━━━━━━<br/>通过 Node IP:Port 访问<br/>适合: 开发测试"]
+    T -->|"LoadBalancer"| C["LoadBalancer Service<br/>━━━━━━━━━━━━━━<br/>云厂商负载均衡器<br/>适合: 生产环境"]
+    T -->|"Headless_ClusterIP"| D["Headless ClusterIP<br/>━━━━━━━━━━━━━━<br/>无 VIP，直接 DNS<br/>适合: 自定义路由"]
+
+    style A fill:#e3f2fd,stroke:#1565c0
+    style B fill:#fff3e0,stroke:#e65100
+    style C fill:#e8f5e9,stroke:#2e7d32
+    style D fill:#f3e5f5,stroke:#6a1b9a
+```
+
+### 2.7 ConfigMap — Flink 配置分发
+
+**源码位置：** `FlinkConfMountDecorator.java:128-154`
+
+```java
+// 源码摘要
+final ConfigMap flinkConfConfigMap = new ConfigMapBuilder()
+    .withApiVersion(Constants.API_VERSION)
+    .withNewMetadata()
+        .withName(getFlinkConfConfigMapName(clusterId))
+    .addToData(data)  // flink-conf.yaml, log4j.properties, logback.xml
+    .build();
+```
+
+| ConfigMap | 包含文件 | 挂载路径 | 挂载目标 |
+|-----------|---------|---------|---------|
+| **Flink 配置** (必选) | `flink-conf.yaml`、`log4j.properties`、`logback.xml` | `/opt/flink/conf` | JM + 所有 TM |
+| **Hadoop 配置** (可选) | `core-site.xml`、`hdfs-site.xml` 等 | 可配置 | JM + 所有 TM |
+
+### 2.8 PVC 和 Secret — 仅引用
+
+Flink **不创建** PVC 和 Secret，只引用用户预先创建好的资源：
+
+- **PVC**（`PersistentVolumeClaimMountDecorator.java`）：通过 `kubernetes.persistent-volume-claims` 配置项引用已有的 PVC，挂载到 JM/TM Pod
+- **Secret**：
+  - `EnvSecretsDecorator`：将 Secret 的 key 映射为容器环境变量
+  - `MountSecretsDecorator`：将 Secret 作为卷挂载到容器中
+
+### 2.9 完整资源拓扑图
+
+```mermaid
+graph TB
+    subgraph "Kubernetes Namespace"
+        subgraph "Flink Cluster: my-flink-app"
+            DEP["<b>Deployment</b><br/>my-flink-app"]
+
+            subgraph "JM Pod"
+                JM["JobManager 容器"]
+                JM_CONF["/opt/flink/conf<br/>(ConfigMap 挂载)"]
+            end
+
+            TM1["<b>Pod</b> (裸)<br/>my-flink-app-taskmanager-0-1"]
+            TM2["<b>Pod</b> (裸)<br/>my-flink-app-taskmanager-0-2"]
+
+            SVC1["<b>Service</b> (Headless)<br/>my-flink-app<br/>RPC:6123 / Blob:6124"]
+            SVC2["<b>Service</b> (ClusterIP)<br/>my-flink-app-rest<br/>REST:8081"]
+
+            CM["<b>ConfigMap</b><br/>flink-conf-my-flink-app"]
+        end
+    end
+
+    DEP -->|"replicas: 1"| JM
+    JM ---|"OwnerRef"| TM1
+    JM ---|"OwnerRef"| TM2
+    SVC1 -->|"selector"| JM
+    SVC2 -->|"selector"| JM
+    CM -->|"volume mount"| JM_CONF
+    CM -->|"volume mount"| TM1
+    CM -->|"volume mount"| TM2
+    TM1 -->|"RPC 注册"| JM
+    TM2 -->|"RPC 注册"| JM
+
+    style DEP fill:#bbdefb,stroke:#1565c0,stroke-width:2px
+    style TM1 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style TM2 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style SVC1 fill:#ffe0b2,stroke:#e65100
+    style SVC2 fill:#ffe0b2,stroke:#e65100
+    style CM fill:#e1bee7,stroke:#6a1b9a
+```
+
+---
+
+## 3. 核心组件介绍
+
+### 3.1 组件交互关系图
 
 ```mermaid
 graph TB
@@ -187,7 +462,7 @@ graph TB
     style KubeClient fill:#b0bec5,stroke:#263238
 ```
 
-### 2.2 核心组件职责说明
+### 3.2 核心组件职责说明
 
 | 组件 | 源码路径 | 核心职责 |
 |------|---------|---------|
@@ -202,9 +477,9 @@ graph TB
 
 ---
 
-## 3. 集群启动流程
+## 4. 集群启动流程
 
-### 3.1 集群启动时序图
+### 4.1 集群启动时序图
 
 ```mermaid
 sequenceDiagram
@@ -253,7 +528,7 @@ sequenceDiagram
     D->>D: 等待 Job 提交 (Session) / 自动提交 (Application)
 ```
 
-### 3.2 启动流程详解
+### 4.2 启动流程详解
 
 #### Session 模式启动
 
@@ -304,9 +579,9 @@ KubernetesApplicationClusterEntrypoint.main()
 
 ---
 
-## 4. Job 提交与启动流程
+## 5. Job 提交与启动流程
 
-### 4.1 Job 提交全链路时序图
+### 5.1 Job 提交全链路时序图
 
 ```mermaid
 sequenceDiagram
@@ -380,7 +655,7 @@ sequenceDiagram
     K8s-->>JM: Task 启动成功
 ```
 
-### 4.2 Job 提交详细流程
+### 5.2 Job 提交详细流程
 
 ```mermaid
 flowchart TD
@@ -426,7 +701,7 @@ flowchart TD
     style U fill:#e1f5fe,stroke:#0277bd
 ```
 
-### 4.3 核心源码调用链
+### 5.3 核心源码调用链
 
 ```
 Dispatcher.submitJob()                     [Dispatcher.java:774]
@@ -447,9 +722,9 @@ Dispatcher.submitJob()                     [Dispatcher.java:774]
 
 ---
 
-## 5. 资源调度与 Slot 管理
+## 6. 资源调度与 Slot 管理
 
-### 5.1 资源请求与分配流程
+### 6.1 资源请求与分配流程
 
 ```mermaid
 flowchart TD
@@ -498,7 +773,7 @@ flowchart TD
     style L fill:#e1f5fe,stroke:#0277bd
 ```
 
-### 5.2 SlotManager 工作机制
+### 6.2 SlotManager 工作机制
 
 ```mermaid
 stateDiagram-v2
@@ -521,7 +796,7 @@ stateDiagram-v2
     异常处理 --> 需求匹配 : 重新调度
 ```
 
-### 5.3 FineGrainedSlotManager 核心逻辑
+### 6.3 FineGrainedSlotManager 核心逻辑
 
 `FineGrainedSlotManager` 是 Kubernetes 部署下的默认 SlotManager 实现，采用声明式资源管理：
 
@@ -558,9 +833,9 @@ FineGrainedSlotManager 核心组件:
 
 ---
 
-## 6. Kubernetes Pod 生命周期管理
+## 7. Kubernetes Pod 生命周期管理
 
-### 6.1 Pod 创建流程
+### 7.1 Pod 创建流程
 
 ```mermaid
 sequenceDiagram
@@ -613,7 +888,7 @@ sequenceDiagram
     Driver->>SM: onWorkerAdded(KubernetesWorkerNode)
 ```
 
-### 6.2 Pod 生命周期状态机
+### 7.2 Pod 生命周期状态机
 
 ```mermaid
 stateDiagram-v2
@@ -654,7 +929,7 @@ stateDiagram-v2
     end note
 ```
 
-### 6.3 Pod 事件处理机制
+### 7.3 Pod 事件处理机制
 
 ```mermaid
 flowchart TD
@@ -694,7 +969,7 @@ flowchart TD
     style S fill:#e3f2fd,stroke:#1565c0
 ```
 
-### 6.4 Pod 命名规范
+### 7.4 Pod 命名规范
 
 ```
 格式: {clusterId}-taskmanager-{attemptId}-{podIndex}
@@ -714,9 +989,9 @@ flowchart TD
 
 ---
 
-## 7. Pod 装饰器模式详解
+## 8. Pod 装饰器模式详解
 
-### 7.1 装饰器架构
+### 8.1 装饰器架构
 
 ```mermaid
 graph TB
@@ -757,7 +1032,7 @@ graph TB
     style TM1 fill:#b2dfdb,stroke:#00695c
 ```
 
-### 7.2 装饰器处理流程
+### 8.2 装饰器处理流程
 
 ```mermaid
 flowchart LR
@@ -786,9 +1061,9 @@ for (KubernetesStepDecorator decorator : decorators) {
 
 ---
 
-## 8. 容错与恢复机制
+## 9. 容错与恢复机制
 
-### 8.1 ResourceManager 重启恢复
+### 9.1 ResourceManager 重启恢复
 
 ```mermaid
 sequenceDiagram
@@ -825,7 +1100,7 @@ sequenceDiagram
     Note over Driver: 后续新 Pod 使用<br/>新的 attemptId
 ```
 
-### 8.2 Pod 故障处理
+### 9.2 Pod 故障处理
 
 ```mermaid
 flowchart TD
@@ -852,7 +1127,7 @@ flowchart TD
     style L fill:#e3f2fd,stroke:#1565c0
 ```
 
-### 8.3 BlockList 机制
+### 9.3 BlockList 机制
 
 当某个 Kubernetes 节点频繁出错时，Flink 会将其加入黑名单：
 
@@ -874,9 +1149,9 @@ InitTaskManagerDecorator 中会设置 NodeAffinity:
 
 ---
 
-## 9. 关键源码索引
+## 10. 关键源码索引
 
-### 9.1 Kubernetes 模块
+### 10.1 Kubernetes 模块
 
 | 文件 | 路径 | 核心方法 |
 |------|------|---------|
@@ -892,7 +1167,7 @@ InitTaskManagerDecorator 中会设置 NodeAffinity:
 | **KubernetesResourceManagerFactory** | `flink-kubernetes/src/.../entrypoint/KubernetesResourceManagerFactory.java` | RM 驱动工厂 |
 | **KubernetesEntrypointUtils** | `flink-kubernetes/src/.../entrypoint/KubernetesEntrypointUtils.java` | 配置加载、端口处理 |
 
-### 9.2 Runtime 核心模块
+### 10.2 Runtime 核心模块
 
 | 文件 | 路径 | 核心方法 |
 |------|------|---------|
@@ -905,7 +1180,7 @@ InitTaskManagerDecorator 中会设置 NodeAffinity:
 | **SlotManager** | `flink-runtime/src/.../slotmanager/SlotManager.java` | `processResourceRequirements()`, `registerTaskManager()`, `reportSlotStatus()` |
 | **FineGrainedSlotManager** | `flink-runtime/src/.../slotmanager/FineGrainedSlotManager.java` | 声明式 Slot 管理实现 |
 
-### 9.3 关键设计模式
+### 10.3 关键设计模式
 
 | 模式 | 应用场景 | 说明 |
 |------|---------|------|
