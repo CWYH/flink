@@ -1193,4 +1193,150 @@ InitTaskManagerDecorator 中会设置 NodeAffinity:
 
 ---
 
+## 11. 面试速讲版：Flink on K8s Job 调度全流程
+
+> 面试时用 2-3 分钟讲清楚整体流程，抓住 **"谁发起 → 谁调度 → 谁执行"** 这条主线。
+
+### 11.1 一图看懂架构
+
+```mermaid
+graph LR
+    subgraph "Client 端"
+        CLI["flink run / REST"]
+    end
+
+    subgraph "JobManager Pod"
+        D["Dispatcher"]
+        JM["JobMaster"]
+        SCH["Scheduler"]
+        SP["SlotPool"]
+        RM["ResourceManager"]
+        SM["SlotManager"]
+        DRV["K8s RM Driver"]
+    end
+
+    subgraph "Kubernetes"
+        API["K8s API"]
+        TM1["TM Pod 1"]
+        TM2["TM Pod 2"]
+        TMN["TM Pod N"]
+    end
+
+    CLI -->|"① 提交 Job"| D
+    D -->|"② 创建"| JM
+    JM -->|"③ 启动调度"| SCH
+    SCH -->|"④ 请求 Slot"| SP
+    SP -->|"⑤ 声明资源需求"| RM
+    RM --> SM
+    SM -->|"⑥ 需要新 Worker"| DRV
+    DRV -->|"⑦ 创建裸 Pod"| API
+    API --> TM1
+    API --> TM2
+    API --> TMN
+    TM1 -->|"⑧ 注册 Slot"| RM
+    RM -->|"⑨ Offer Slot"| SP
+    SP -->|"⑩ Slot 就绪"| SCH
+    SCH -->|"⑪ 部署 Task"| TM1
+
+    style CLI fill:#f9f9f9,stroke:#666
+    style D fill:#ede7f6,stroke:#5e35b1
+    style JM fill:#fff3e0,stroke:#e65100
+    style SCH fill:#fce4ec,stroke:#c62828
+    style SP fill:#fff8e1,stroke:#f9a825
+    style RM fill:#e8f5e9,stroke:#2e7d32
+    style SM fill:#e8f5e9,stroke:#2e7d32
+    style DRV fill:#e3f2fd,stroke:#1565c0
+    style API fill:#f5f5f5,stroke:#424242
+    style TM1 fill:#e0f7fa,stroke:#00838f
+    style TM2 fill:#e0f7fa,stroke:#00838f
+    style TMN fill:#e0f7fa,stroke:#00838f
+```
+
+### 11.2 调度全流程（11 步）
+
+```mermaid
+flowchart TD
+    S1["① Client 提交 Job"]:::step
+    S2["② Dispatcher 验证并创建 JobMaster"]:::step
+    S3["③ JobMaster 启动 DefaultScheduler"]:::step
+    S4["④ Scheduler 通过 SchedulingStrategy<br/>确定待调度的 ExecutionVertex"]:::step
+    S5["⑤ ExecutionSlotAllocator 向 SlotPool 请求 Slot"]:::step
+    S6{"⑥ 是否有空闲 Slot?"}:::decision
+    S7["⑦ SlotPool 声明资源需求 → ResourceManager<br/>→ SlotManager 计算资源缺口"]:::step
+    S8["⑧ KubernetesResourceManagerDriver<br/>调用 K8s API 创建 TaskManager 裸 Pod"]:::k8s
+    S9["⑨ K8s 调度 Pod 到 Node → 容器启动<br/>→ TaskManager 向 ResourceManager 注册 Slot"]:::k8s
+    S10["⑩ ResourceManager 将 Slot Offer 给 JobMaster<br/>→ SlotPool 匹配并接受 Slot"]:::step
+    S11["⑪ ExecutionDeployer 通过 RPC<br/>向 TaskManager 部署 Task → Job 运行"]:::step
+    S6Y["直接分配已有 Slot"]:::step
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    S6 -->|"否"| S7 --> S8 --> S9 --> S10
+    S6 -->|"是"| S6Y --> S10
+    S10 --> S11
+
+    classDef step fill:#f9f9f9,stroke:#555,color:#333
+    classDef decision fill:#fff8e1,stroke:#f9a825,color:#333
+    classDef k8s fill:#e3f2fd,stroke:#1565c0,color:#333
+```
+
+### 11.3 面试口述要点卡片
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🎯 一句话总结                                                    │
+│  Client → Dispatcher → JobMaster → Scheduler → SlotPool        │
+│  → ResourceManager → K8s API (创建 TM Pod) → TM 注册 Slot       │
+│  → Slot 分配回 Scheduler → 部署 Task → Job 运行                  │
+├─────────────────────────────────────────────────────────────────┤
+│  📌 三个关键角色                                                  │
+│  ┌──────────────┬──────────────────────────────────────────┐    │
+│  │ JobMaster    │ 单个 Job 的"管家"，管理执行图和 SlotPool    │    │
+│  │ Scheduler    │ 调度引擎，决定 何时/哪些 Vertex 需要部署    │    │
+│  │ ResourceMgr  │ 资源协调者，向 K8s 请求/释放 TM Pod        │    │
+│  └──────────────┴──────────────────────────────────────────┘    │
+├─────────────────────────────────────────────────────────────────┤
+│  📌 四个 K8s 特有设计                                             │
+│  1. JM 用 Deployment（K8s 管生命周期，支持 HA 多副本）            │
+│  2. TM 用裸 Pod（Flink 自行按需伸缩，支持异构资源）               │
+│  3. OwnerReference 级联删除（JM 删了 TM 自动清理）               │
+│  4. Pod Watch 机制（实时感知 TM Pod 状态变化）                    │
+├─────────────────────────────────────────────────────────────────┤
+│  📌 声明式 Slot 管理 (FineGrainedSlotManager)                    │
+│  • JobMaster 不直接请求 Pod，而是声明"我需要多少资源"              │
+│  • SlotManager 对比 需求 vs 已有资源 → 计算缺口                  │
+│  • 缺口部分才触发 K8s Pod 创建，多余部分触发释放                   │
+├─────────────────────────────────────────────────────────────────┤
+│  📌 容错要点                                                     │
+│  • TM Pod 挂了 → Watcher 感知 → 释放 Slot → 重新请求 Pod         │
+│  • 问题节点 → BlockList → NodeAffinity NotIn 屏蔽               │
+│  • RM 重启 → 查询已有 Pod → recoverWorkerNodes 恢复状态          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 11.4 核心类速查（面试加分项）
+
+```mermaid
+graph TD
+    subgraph "面试提到这些类名会加分"
+        A["KubernetesApplicationClusterEntrypoint<br/>· Application 模式入口"]:::cls
+        B["Dispatcher<br/>· 接收 Job，创建 JobMaster"]:::cls
+        C["JobMaster<br/>· 管理单个 Job 的全生命周期"]:::cls
+        D["DefaultScheduler<br/>· 核心调度引擎"]:::cls
+        E["FineGrainedSlotManager<br/>· 声明式 Slot 管理"]:::cls
+        F["KubernetesResourceManagerDriver<br/>· K8s Pod 创建/监听"]:::cls
+        G["DeclarativeSlotPool<br/>· Job 级 Slot 需求管理"]:::cls
+    end
+
+    A -->|"启动集群"| B
+    B -->|"创建"| C
+    C -->|"委托"| D
+    D -->|"请求 Slot"| G
+    G -->|"声明需求"| E
+    E -->|"请求 Pod"| F
+
+    classDef cls fill:#fafafa,stroke:#888,color:#333
+```
+
+---
+
 > **本文档基于 Apache Flink 源码分析生成，覆盖了 Flink on Kubernetes 的核心调度流程与 Job 启动全链路。**
